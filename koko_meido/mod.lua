@@ -246,30 +246,77 @@ local function isBlacklisted(id)
 	return blacklist.ids[id] == true
 end
 
+-- How much state do I need to keep...
 -- Keeps track of per-id `seq`s at which they were kicked
 local kickedAt = {}
+local kickSucceeded = {}
+local inFlight = {}
 
-local function kickById(id, nickname, seq)
-	if not id or (kickedAt[id] and seq and seq <= kickedAt[id]) then
-		return
+local RATE_LIMIT_DELAY = 1
+local rateLimited = false
+local retryQueue = {} -- id, nickname, seq
+
+local kickById -- forward
+
+local function openGate()
+	rateLimited = false
+	local q = retryQueue
+	retryQueue = {}
+	for _, item in ipairs(q) do
+		kickById(item.id, item.nickname, item.seq)
 	end
-	if seq then
-		kickedAt[id] = seq
+end
+
+local function holdKick(id, nickname, seq)
+	for _, item in ipairs(retryQueue) do
+		if item.id == id then
+			return
+		end
 	end
+	table.insert(retryQueue, { id = id, nickname = nickname, seq = seq })
+end
+
+local function kickAttempt(id, nickname, seq)
 	local ok, err = pcall(function()
 		LobbyNetMgr.SendLobbyRequest("roomKickPlayer", { id = id }, function(res_err, _)
-			if res_err ~= nil then
-				kickedAt[id] = nil
-				log("kick of " .. tostring(nickname or id) .. " refused: " .. tostring(res_err))
-			else
+			inFlight[id] = nil
+			if res_err == nil then
 				log("kicked " .. tostring(nickname or "?") .. " (" .. tostring(id) .. ")")
+				if seq then
+					kickedAt[id] = seq
+				end
+				return
+			end
+			log("kick of " .. tostring(nickname or id) .. " refused: " .. tostring(res_err))
+			holdKick(id, nickname, seq)
+			if not rateLimited then
+				rateLimited = true
+				pcall(function()
+					TimeMgr.Delay(RATE_LIMIT_DELAY, openGate)
+				end)
 			end
 		end)
 	end)
 	if not ok then
-		kickedAt[id] = nil
+		inFlight[id] = nil
 		log("kick failed: " .. tostring(err))
 	end
+end
+
+kickById = function(id, nickname, seq)
+	if not id or kickSucceeded[id] or inFlight[id]
+		or (kickedAt[id] and seq and seq <= kickedAt[id]) then
+		return
+	end
+	if rateLimited then
+		holdKick(id, nickname, seq)
+		return
+	end
+	 if seq then
+		kickedAt[id] = seq
+	end
+	inFlight[id] = true
+	kickAttempt(id, nickname, seq)
 end
 
 local function playerIsHost(room)
@@ -309,6 +356,16 @@ local function roomUpdateKick(msg, room)
 	for id in pairs(kickedAt) do
 		if not seated[id] then
 			kickedAt[id] = nil
+		end
+	end
+	for id in pairs(inFlight) do
+		if not seated[id] then
+			inFlight[id] = nil
+		end
+	end
+	for i = #retryQueue, 1, -1 do
+		if not seated[retryQueue[i].id] then
+			table.remove(retryQueue, i)
 		end
 	end
 
@@ -647,6 +704,9 @@ MjsLua.hook("UI_FriendRoom.OnShow", function(orig, self, ...)
 	local results = pack(orig(self, ...))
 	state.room = self
 	kickedAt = {}
+	kickSucceeded = {}
+	inFlight = {}
+	retryQueue = {}
 	buildToggleButton(self)
 	return unpackResults(results)
 end)
